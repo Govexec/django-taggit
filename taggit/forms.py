@@ -1,5 +1,5 @@
-import os
 from __future__ import unicode_literals
+import os
 
 from django import forms
 from django.utils import six
