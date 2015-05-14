@@ -7,15 +7,26 @@ from django.contrib.contenttypes.models import ContentType
 from django.db import models, router
 from django.db.models.fields import Field
 from django.db.models.fields.related import (add_lazy_relation, ManyToManyRel,
-                                             RelatedField)
-from django.db.models.related import RelatedObject
+                                             OneToOneRel, RelatedField)
+
+if VERSION < (1, 8):
+    # related.py was removed in Django 1.8
+
+    # Depending on how Django was updated, related.py could still exist
+    # on the users system even on Django 1.8+, so we check the Django
+    # version before importing it to make sure this doesn't get imported
+    # accidentally.
+    from django.db.models.related import RelatedObject
+else:
+    RelatedObject = None
+
 from django.utils import six
 from django.utils.text import capfirst
 from django.utils.translation import ugettext_lazy as _
 
 from taggit.forms import TagField
 from taggit.models import GenericTaggedItemBase, TaggedItem
-from taggit.utils import require_instance_manager
+from taggit.utils import _get_field, require_instance_manager
 
 try:
     from django.contrib.contenttypes.fields import GenericRelation
@@ -23,10 +34,12 @@ except ImportError:  # django < 1.7
     from django.contrib.contenttypes.generic import GenericRelation
 
 try:
-    from django.db.models.related import PathInfo
-except ImportError:
-    pass  # PathInfo is not used on Django < 1.6
-
+    from django.db.models.query_utils import PathInfo
+except ImportError:  # Django < 1.8
+    try:
+        from django.db.models.related import PathInfo
+    except ImportError:
+        pass  # PathInfo is not used on Django < 1.6
 
 
 def _model_name(model):
@@ -88,11 +101,12 @@ class _TaggableManager(models.Manager):
     def is_cached(self, instance):
         return self.prefetch_cache_name in instance._prefetched_objects_cache
 
-    def get_queryset(self):
+    def get_queryset(self, extra_filters=None):
         try:
             return self.instance._prefetched_objects_cache[self.prefetch_cache_name]
         except (AttributeError, KeyError):
-            return self.through.tags_for(self.model, self.instance)
+            kwargs = extra_filters if extra_filters else {}
+            return self.through.tags_for(self.model, self.instance, **kwargs)
 
     def get_prefetch_queryset(self, instances, queryset=None):
         if queryset is not None:
@@ -113,7 +127,7 @@ class _TaggableManager(models.Manager):
         source_col = fk.column
         connection = connections[db]
         qn = connection.ops.quote_name
-        qs = self.get_queryset().using(db)._next_is_sticky().filter(**query).extra(
+        qs = self.get_queryset(query).using(db).extra(
             select={
                 '_prefetch_related_val': '%s.%s' % (qn(join_table), qn(source_col))
             }
@@ -216,7 +230,7 @@ class _TaggableManager(models.Manager):
         if len(lookup_keys) == 1:
             # Can we do this without a second query by using a select_related()
             # somehow?
-            f = self.through._meta.get_field_by_name(lookup_keys[0])[0]
+            f = _get_field(self.through, lookup_keys[0])
             objs = f.rel.to._default_manager.filter(**{
                 "%s__in" % f.rel.field_name: [r["content_object"] for r in qs]
             })
@@ -242,20 +256,42 @@ class _TaggableManager(models.Manager):
             results.append(obj)
         return results
 
+    # _TaggableManager needs to be hashable but BaseManagers in Django 1.8+ overrides
+    # the __eq__ method which makes the default __hash__ method disappear.
+    # This checks if the __hash__ attribute is None, and if so, it reinstates the original method.
+    if models.Manager.__hash__ is None:
+        __hash__ = object.__hash__
+
 
 class TaggableManager(RelatedField, Field):
+    # Field flags
+    many_to_many = True
+    many_to_one = False
+    one_to_many = False
+    one_to_one = False
+
     _related_name_counter = 0
 
     def __init__(self, verbose_name=_("Tags"),
                  help_text=_("A comma-separated list of tags."),
                  through=None, blank=False, related_name=None, to=None,
                  manager=_TaggableManager):
-        Field.__init__(self, verbose_name=verbose_name, help_text=help_text,
-                       blank=blank, null=True, serialize=False)
+
         self.through = through or TaggedItem
-        self.rel = TaggableRel(self, related_name, self.through, to=to)
         self.swappable = False
         self.manager = manager
+
+        rel = TaggableRel(self, related_name, self.through, to=to)
+
+        Field.__init__(
+            self,
+            verbose_name=verbose_name,
+            help_text=help_text,
+            blank=blank,
+            null=True,
+            serialize=False,
+            rel=rel,
+        )
         # NOTE: `to` is ignored, only used via `deconstruct`.
 
     def __get__(self, instance, model):
@@ -315,6 +351,9 @@ class TaggableManager(RelatedField, Field):
             else:
                 self.post_through_setup(cls)
 
+    def get_internal_type(self):
+        return 'ManyToManyField'
+
     def __lt__(self, other):
         """
         Required contribute_to_class as Django uses bisect
@@ -324,13 +363,18 @@ class TaggableManager(RelatedField, Field):
         return False
 
     def post_through_setup(self, cls):
-        self.related = RelatedObject(cls, self.model, self)
+        if RelatedObject is not None:  # Django < 1.8
+            self.related = RelatedObject(cls, self.model, self)
+
         self.use_gfk = (
             self.through is None or issubclass(self.through, GenericTaggedItemBase)
         )
         if not self.rel.to:
             self.rel.to = self.through._meta.get_field("tag").rel.to
-        self.related = RelatedObject(self.through, cls, self)
+
+        if RelatedObject is not None:  # Django < 1.8
+            self.related = RelatedObject(self.through, cls, self)
+
         if self.use_gfk:
             tagged_items = GenericRelation(self.through)
             tagged_items.contribute_to_class(cls, 'tagged_items')
@@ -363,10 +407,10 @@ class TaggableManager(RelatedField, Field):
         return _model_name(self.model)
 
     def m2m_reverse_name(self):
-        return self.through._meta.get_field_by_name("tag")[0].column
+        return _get_field(self.through, 'tag').column
 
     def m2m_reverse_field_name(self):
-        return self.through._meta.get_field_by_name("tag")[0].name
+        return _get_field(self.through, 'tag').name
 
     def m2m_target_field_name(self):
         return self.model._meta.pk.name
@@ -404,7 +448,7 @@ class TaggableManager(RelatedField, Field):
             alias_to_join = rhs_alias
         else:
             alias_to_join = lhs_alias
-        extra_col = self.through._meta.get_field_by_name('content_type')[0].column
+        extra_col = _get_field(self.through, 'content_type').column
         content_type_ids = [ContentType.objects.get_for_model(subclass).pk for
                             subclass in _get_subclasses(self.model)]
         if len(content_type_ids) == 1:
@@ -423,8 +467,8 @@ class TaggableManager(RelatedField, Field):
     # This and all the methods till the end of class are only used in django >= 1.6
     def _get_mm_case_path_info(self, direct=False):
         pathinfos = []
-        linkfield1 = self.through._meta.get_field_by_name('content_object')[0]
-        linkfield2 = self.through._meta.get_field_by_name(self.m2m_reverse_field_name())[0]
+        linkfield1 = _get_field(self.through, 'content_object')
+        linkfield2 = _get_field(self.through, self.m2m_reverse_field_name())
         if direct:
             join1infos = linkfield1.get_reverse_path_info()
             join2infos = linkfield2.get_path_info()
@@ -439,8 +483,8 @@ class TaggableManager(RelatedField, Field):
         pathinfos = []
         from_field = self.model._meta.pk
         opts = self.through._meta
-        object_id_field = opts.get_field_by_name('object_id')[0]
-        linkfield = self.through._meta.get_field_by_name(self.m2m_reverse_field_name())[0]
+        object_id_field = _get_field(self.through, 'object_id')
+        linkfield = _get_field(self.through, self.m2m_reverse_field_name())
         if direct:
             join1infos = [PathInfo(self.model._meta, opts, [from_field], self.rel, True, False)]
             join2infos = linkfield.get_path_info()
@@ -470,7 +514,7 @@ class TaggableManager(RelatedField, Field):
             return (("object_id", "id"),)
 
     def get_extra_restriction(self, where_class, alias, related_alias):
-        extra_col = self.through._meta.get_field_by_name('content_type')[0].column
+        extra_col = _get_field(self.through, 'content_type').column
         content_type_ids = [ContentType.objects.get_for_model(subclass).pk
                             for subclass in _get_subclasses(self.model)]
         return ExtraJoinRestriction(related_alias, extra_col, content_type_ids)
@@ -480,8 +524,7 @@ class TaggableManager(RelatedField, Field):
 
     @property
     def related_fields(self):
-        return [(self.through._meta.get_field_by_name('object_id')[0],
-                 self.model._meta.pk)]
+        return [(_get_field(self.through, 'object_id'), self.model._meta.pk)]
 
     @property
     def foreign_related_fields(self):
@@ -490,9 +533,18 @@ class TaggableManager(RelatedField, Field):
 
 def _get_subclasses(model):
     subclasses = [model]
-    for f in model._meta.get_all_field_names():
-        field = model._meta.get_field_by_name(f)[0]
-        if (isinstance(field, RelatedObject) and
+    if VERSION < (1, 8):
+        all_fields = (_get_field(model, f) for f in model._meta.get_all_field_names())
+    else:
+        all_fields = model._meta.get_fields()
+    for field in all_fields:
+        # Django 1.8 +
+        if (not RelatedObject and isinstance(field, OneToOneRel) and
+                getattr(field.field.rel, "parent_link", None)):
+            subclasses.extend(_get_subclasses(field.related_model))
+
+        # < Django 1.8
+        if (RelatedObject and isinstance(field, RelatedObject) and
                 getattr(field.field.rel, "parent_link", None)):
             subclasses.extend(_get_subclasses(field.model))
     return subclasses
