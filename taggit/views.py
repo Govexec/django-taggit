@@ -3,11 +3,11 @@ from django.shortcuts import get_object_or_404
 from django.views.generic.list_detail import object_list
 from django.core import serializers
 from django.http import HttpResponse
-from cachecow.pagecache import cache_page
+from cachew.decorators import cache_page_function as cache_page
 
 from taggit.models import TaggedItem, Tag
 
-@cache_page
+@cache_page(900)
 def ajax(request):
 	''' get all of the tags available and return as a json array'''
 	data = serializers.serialize('json', Tag.objects.order_by('slug').all(),
