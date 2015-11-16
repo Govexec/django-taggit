@@ -191,7 +191,7 @@ class _TaggableManager(models.Manager):
         ).order_by('-num_times')
 
     @require_instance_manager
-    def similar_objects(self, num=None, extra_order_by=None, hints=None, **filters):
+    def similar_objects(self, num=None, extra_order_by=None, hints=None, select_related=None, **filters):
         lookup_kwargs = self._lookup_kwargs()
         lookup_keys = sorted(lookup_kwargs)
         qs = self.through.objects.values(*lookup_kwargs.keys())
@@ -199,6 +199,7 @@ class _TaggableManager(models.Manager):
         qs = qs.exclude(**lookup_kwargs)
         subq = self.all()
         qs = qs.filter(tag__in=list(subq))
+
         if hints:
             qs = qs.with_hints(hints=hints)
 
@@ -232,7 +233,11 @@ class _TaggableManager(models.Manager):
 
             for ct, obj_ids in preload.iteritems():
                 ct = ContentType.objects.get_for_id(ct)
-                for obj in ct.model_class()._default_manager.filter(pk__in=obj_ids):
+
+                ct_qs = ct.model_class()._default_manager.filter(pk__in=obj_ids)
+                if select_related:
+                    ct_qs = ct_qs.select_related(*select_related)
+                for obj in ct_qs:
                     items[(ct.pk, obj.pk)] = obj
 
         results = []
